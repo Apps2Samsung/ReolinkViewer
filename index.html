@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=1920, height=1080, user-scalable=no">
+    <title>Reolink Viewer</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<!-- ============ Setup screen ============ -->
+<section id="view-setup" class="view">
+    <header>
+        <h1>Reolink Viewer</h1>
+        <p class="hint">Enter the camera's local IP and login, then choose Start. Use the remote's arrow keys to move, OK to edit.</p>
+    </header>
+
+    <div id="form" class="form">
+        <div class="row focusable" data-field="host" data-type="text">
+            <label>Camera / NVR IP address</label>
+            <input id="f-host" type="text" placeholder="192.168.1.50" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="row focusable" data-field="user" data-type="text">
+            <label>Username</label>
+            <input id="f-user" type="text" placeholder="admin" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="row focusable" data-field="password" data-type="text">
+            <label>Password</label>
+            <input id="f-password" type="password" placeholder="password" autocomplete="off">
+        </div>
+        <div class="row focusable" data-field="stream" data-type="toggle" data-options="sub,main,ext">
+            <label>Stream</label>
+            <div class="value" id="f-stream"></div>
+            <div class="row-hint">Sub = low bandwidth H.264 (works on every camera). Main = full quality, but must be H.264.</div>
+        </div>
+        <div class="row focusable" data-field="channel" data-type="stepper" data-min="0" data-max="63">
+            <label>Channel</label>
+            <div class="value" id="f-channel"></div>
+            <div class="row-hint">0 for a standalone camera. On an NVR, the channel number of the camera.</div>
+        </div>
+        <div class="row focusable" data-field="audio" data-type="toggle" data-options="on,off">
+            <label>Audio</label>
+            <div class="value" id="f-audio"></div>
+        </div>
+        <div class="row focusable" data-field="scheme" data-type="toggle" data-options="http,https">
+            <label>Protocol</label>
+            <div class="value" id="f-scheme"></div>
+            <div class="row-hint">Keep http unless "HTTPS only" is enabled on the camera.</div>
+        </div>
+        <div class="row focusable" data-field="port" data-type="text">
+            <label>HTTP port</label>
+            <input id="f-port" type="text" inputmode="numeric" placeholder="80" autocomplete="off">
+        </div>
+        <div class="row focusable" data-field="autoconnect" data-type="toggle" data-options="off,on">
+            <label>Connect automatically on launch</label>
+            <div class="value" id="f-autoconnect"></div>
+        </div>
+
+        <div class="row button focusable primary" data-action="start">Start</div>
+    </div>
+
+    <footer>
+        <span id="setup-message"></span>
+        <span class="keys">▲▼ move &nbsp; ◀▶ change &nbsp; OK edit / select &nbsp; RETURN exit</span>
+    </footer>
+</section>
+
+<!-- ============ Player screen ============ -->
+<section id="view-player" class="view hidden">
+    <video id="video" playsinline></video>
+
+    <div id="overlay" class="overlay">
+        <div id="status" class="status">Connecting…</div>
+        <div id="stats" class="stats"></div>
+        <div class="keys">OK info &nbsp; CH ▲▼ channel &nbsp; RETURN back</div>
+    </div>
+</section>
+
+<script src="js/vendor/mpegts.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

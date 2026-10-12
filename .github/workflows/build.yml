@@ -1,0 +1,43 @@
+name: Build package
+
+# A Tizen web app package (.wgt) is a zip of the widget directory with
+# config.xml at its root. The package built here is UNSIGNED: a TV only installs
+# a package signed with a certificate bound to that TV, so sign it before
+# installing (Apps2Samsung does this for you) or use build.sh with a Tizen
+# Studio profile.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check JavaScript syntax
+        run: node -e "new Function(require('fs').readFileSync('js/app.js', 'utf8'))"
+
+      - name: Build ReolinkViewer.wgt
+        run: |
+          mkdir -p dist
+          zip -r -X dist/ReolinkViewer.wgt config.xml index.html icon.png css js
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReolinkViewer
+          path: dist/ReolinkViewer.wgt
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ReolinkViewer.wgt
+          generate_release_notes: true

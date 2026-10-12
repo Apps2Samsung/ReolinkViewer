@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets"
+        id="http://reolinkviewer.local/ReolinkViewer" version="1.0.0" viewmodes="maximized">
+    <tizen:application id="ReoLnkVwr1.ReolinkViewer" package="ReoLnkVwr1" required_version="2.4"/>
+    <content src="index.html"/>
+    <feature name="http://tizen.org/feature/screen.size.all"/>
+    <icon src="icon.png"/>
+    <name>Reolink Viewer</name>
+    <description>Local-network live viewer for Reolink cameras and NVRs.</description>
+
+    <!-- Allow the app to talk to any host on the LAN (camera IP is user-supplied). -->
+    <access origin="*" subdomains="true"/>
+    <tizen:privilege name="http://tizen.org/privilege/internet"/>
+    <tizen:privilege name="http://tizen.org/privilege/tv.inputdevice"/>
+
+    <tizen:profile name="tv"/>
+    <tizen:setting screen-orientation="landscape"
+                   context-menu="disable"
+                   background-support="disable"
+                   encryption="disable"
+                   install-location="auto"
+                   hwkey-event="enable"/>
+    <tizen:metadata key="http://samsung.com/tv/metadata/use.network" value="true"/>
+</widget>
