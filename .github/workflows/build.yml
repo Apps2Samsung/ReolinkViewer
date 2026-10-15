@@ -1,10 +1,11 @@
 name: Build package
 
-# A Tizen web app package (.wgt) is a zip of the widget directory with
-# config.xml at its root. The package built here is UNSIGNED: a TV only installs
-# a package signed with a certificate bound to that TV, so sign it before
-# installing (Apps2Samsung does this for you) or use build.sh with a Tizen
-# Studio profile.
+# Two Tizen web app packages (.wgt), both UNSIGNED: a TV only installs a
+# package signed with a certificate bound to that TV, so sign before installing
+# (Apps2Samsung does this for you) or use build.sh --sign with a Tizen Studio
+# profile.
+#   ReolinkViewer.wgt         2018+ TVs (Tizen 4.0): HTTP-FLV and RTSP/H.265 relay
+#   ReolinkViewer-legacy.wgt  2016-2017 TVs (Tizen 2.4): HTTP-FLV only
 
 on:
   push:
@@ -22,22 +23,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check JavaScript syntax
-        run: node -e "new Function(require('fs').readFileSync('js/app.js', 'utf8'))"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-      - name: Build ReolinkViewer.wgt
+      - name: Check JavaScript syntax
         run: |
-          mkdir -p dist
-          zip -r -X dist/ReolinkViewer.wgt config.xml index.html icon.png css js
+          node -e "new Function(require('fs').readFileSync('js/app.js', 'utf8'))"
+          node -e "new Function(require('fs').readFileSync('service/relay.js', 'utf8'))"
+
+      - name: Test the relay service
+        run: node --test tests
+
+      - name: Build packages
+        run: ./build.sh
 
       - uses: actions/upload-artifact@v4
         with:
           name: ReolinkViewer
-          path: dist/ReolinkViewer.wgt
+          path: dist/*.wgt
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/ReolinkViewer.wgt
+          files: dist/*.wgt
           generate_release_notes: true

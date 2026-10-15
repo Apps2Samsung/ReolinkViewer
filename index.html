@@ -28,10 +28,15 @@
             <label>Password</label>
             <input id="f-password" type="password" placeholder="password" autocomplete="off">
         </div>
+        <div class="row focusable" data-field="mode" data-type="toggle" data-options="flv,rtsp">
+            <label>Connection</label>
+            <div class="value" id="f-mode"></div>
+            <div class="row-hint">HTTP-FLV plays H.264 straight from the camera and works on every TV. RTSP goes through a relay inside the app and also plays H.265 main streams (2018 and newer TVs).</div>
+        </div>
         <div class="row focusable" data-field="stream" data-type="toggle" data-options="sub,main,ext">
             <label>Stream</label>
             <div class="value" id="f-stream"></div>
-            <div class="row-hint">Sub = low bandwidth H.264 (works on every camera). Main = full quality, but must be H.264.</div>
+            <div class="row-hint">Sub = low bandwidth, works everywhere. Main = full quality; over HTTP-FLV it must be H.264, over RTSP H.265 is fine too.</div>
         </div>
         <div class="row focusable" data-field="channel" data-type="stepper" data-min="0" data-max="63">
             <label>Channel</label>
@@ -42,14 +47,28 @@
             <label>Audio</label>
             <div class="value" id="f-audio"></div>
         </div>
-        <div class="row focusable" data-field="scheme" data-type="toggle" data-options="http,https">
+        <div class="row focusable" data-field="scheme" data-type="toggle" data-options="http,https" data-mode="flv">
             <label>Protocol</label>
             <div class="value" id="f-scheme"></div>
             <div class="row-hint">Keep http unless "HTTPS only" is enabled on the camera.</div>
         </div>
-        <div class="row focusable" data-field="port" data-type="text">
+        <div class="row focusable" data-field="port" data-type="text" data-mode="flv">
             <label>HTTP port</label>
             <input id="f-port" type="text" inputmode="numeric" placeholder="80" autocomplete="off">
+        </div>
+        <div class="row focusable" data-field="rtspPort" data-type="text" data-mode="rtsp">
+            <label>RTSP port</label>
+            <input id="f-rtspPort" type="text" inputmode="numeric" placeholder="554" autocomplete="off">
+        </div>
+        <div class="row focusable" data-field="rtspPath" data-type="text" data-mode="rtsp">
+            <label>RTSP path</label>
+            <input id="f-rtspPath" type="text" placeholder="automatic" autocomplete="off" spellcheck="false">
+            <div class="row-hint">Leave empty: the app tries Reolink's h265Preview, h264Preview and Preview paths for the channel and stream above. Fill in a path such as h264Preview_01_main to override.</div>
+        </div>
+        <div class="row focusable" data-field="rtspPlayer" data-type="toggle" data-options="auto,mse,avplay" data-mode="rtsp">
+            <label>Player</label>
+            <div class="value" id="f-rtspPlayer"></div>
+            <div class="row-hint">Automatic uses the browser player (lowest delay) and switches to the TV player when the browser cannot decode the stream. The TV player runs a few seconds behind live.</div>
         </div>
         <div class="row focusable" data-field="autoconnect" data-type="toggle" data-options="off,on">
             <label>Connect automatically on launch</label>
@@ -68,6 +87,8 @@
 <!-- ============ Player screen ============ -->
 <section id="view-player" class="view hidden">
     <video id="video" playsinline></video>
+    <!-- AVPlay draws on a hardware plane behind the page; this marks its area. -->
+    <object id="av-player" type="application/avplayer" class="hidden"></object>
 
     <div id="overlay" class="overlay">
         <div id="status" class="status">Connecting…</div>
@@ -76,6 +97,7 @@
     </div>
 </section>
 
+<script src="$WEBAPIS/webapis/webapis.js"></script>
 <script src="js/vendor/mpegts.js"></script>
 <script src="js/app.js"></script>
 </body>

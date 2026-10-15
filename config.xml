@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <widget xmlns="http://www.w3.org/ns/widgets" xmlns:tizen="http://tizen.org/ns/widgets"
-        id="http://reolinkviewer.local/ReolinkViewer" version="1.0.0" viewmodes="maximized">
-    <tizen:application id="ReoLnkVwr1.ReolinkViewer" package="ReoLnkVwr1" required_version="2.4"/>
+        id="http://reolinkviewer.local/ReolinkViewer" version="1.1.0" viewmodes="maximized">
+    <tizen:application id="ReoLnkVwr1.ReolinkViewer" package="ReoLnkVwr1" required_version="4.0"/>
     <content src="index.html"/>
     <feature name="http://tizen.org/feature/screen.size.all"/>
     <icon src="icon.png"/>
@@ -12,6 +12,19 @@
     <access origin="*" subdomains="true"/>
     <tizen:privilege name="http://tizen.org/privilege/internet"/>
     <tizen:privilege name="http://tizen.org/privilege/tv.inputdevice"/>
+
+    <!-- rtsp-mode:begin
+         The RTSP relay: a background service (Node.js runtime, Tizen 4.0+) that
+         turns the camera's RTSP stream into MPEG-TS on 127.0.0.1:8129. build.sh
+         removes this block, and sets required_version back to 2.4, for the
+         legacy package that 2016-2017 TVs can install. -->
+    <tizen:service id="ReoLnkVwr1.relay" type="service">
+        <tizen:content src="service/relay.js"/>
+        <tizen:name>relay</tizen:name>
+    </tizen:service>
+    <tizen:privilege name="http://tizen.org/privilege/application.launch"/>
+    <tizen:allow-mixed-content>true</tizen:allow-mixed-content>
+    <!-- rtsp-mode:end -->
 
     <tizen:profile name="tv"/>
     <tizen:setting screen-orientation="landscape"
