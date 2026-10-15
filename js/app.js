@@ -1,14 +1,25 @@
 /*
  * Reolink Viewer for Samsung Tizen TVs.
  *
- * Plays the camera's HTTP-FLV live stream (H.264 + AAC) through Media Source
- * Extensions using mpegts.js. Everything stays on the local network; the only
- * thing the app talks to is the camera / NVR the user typed in.
+ * Two ways to get the picture:
+ *
+ *  - HTTP-FLV: the camera's own FLV-over-HTTP live stream (H.264 + AAC), fed
+ *    to the TV's decoder through Media Source Extensions by mpegts.js. Works on
+ *    every Tizen TV, but H.264 only.
+ *  - RTSP: the camera's RTSP stream, fetched by the relay service that ships
+ *    inside this package (service/relay.js) and re-served on 127.0.0.1 as
+ *    MPEG-TS. That stream is played either by mpegts.js (MSE, low delay) or,
+ *    when the browser cannot decode H.265, by Samsung's AVPlay from a live
+ *    HLS playlist. Needs Tizen 4.0 (2018 models) for the service.
+ *
+ * Everything stays on the local network; the only thing the app talks to is
+ * the camera / NVR the user typed in, and the relay on the TV itself.
  */
 (function () {
     'use strict';
 
     var STORAGE_KEY = 'reolink-viewer-settings';
+    var RELAY_BASE = 'http://127.0.0.1:8129';
 
     // Samsung TV remote key codes. Arrows / Enter are standard; the rest are Tizen-specific.
     var KEY = {
@@ -27,7 +38,20 @@
         stream: 'sub',
         channel: 0,
         audio: 'on',
+        mode: 'flv',            // 'flv' | 'rtsp'
+        rtspPort: '554',
+        rtspPath: '',           // '' = Reolink's standard paths
+        rtspPlayer: 'auto',     // 'auto' | 'mse' | 'avplay'
         autoconnect: 'off'
+    };
+
+    // Display names for toggle values that are not self-explanatory.
+    var LABELS = {
+        flv: 'HTTP-FLV (H.264)',
+        rtsp: 'RTSP via relay (H.264 / H.265)',
+        auto: 'Automatic',
+        mse: 'Browser (MSE)',
+        avplay: 'TV player (AVPlay)'
     };
 
     var MPEGTS_CONFIG = {
@@ -50,6 +74,11 @@
     var RECONNECT_MAX_MS = 30000;
     var OVERLAY_HIDE_MS = 4000;
 
+    var RELAY_LAUNCH_TRIES = 25;          // x 300 ms waiting for the service to answer /ping
+    var RELAY_START_TIMEOUT_MS = 25000;   // relay must reach 'playing' (first keyframe) in this time
+    var RELAY_POLL_MS = 1000;
+    var HLS_MIN_SEGMENTS = 3;             // AVPlay wants a few segments before it starts
+
     var settings = loadSettings();
 
     var el = {
@@ -58,20 +87,29 @@
         form: document.getElementById('form'),
         setupMessage: document.getElementById('setup-message'),
         video: document.getElementById('video'),
+        avObject: document.getElementById('av-player'),
         overlay: document.getElementById('overlay'),
         status: document.getElementById('status'),
         stats: document.getElementById('stats')
     };
 
     var rows = Array.prototype.slice.call(el.form.querySelectorAll('.focusable'));
-    var focusIndex = 0;
+    var focusedRow = null;
     var currentView = 'setup';
 
-    var player = null;
+    var player = null;              // mpegts.js player (FLV or relay TS)
+    var avplayActive = false;       // AVPlay has a stream open
+    var avplayPaused = false;
+    var activeBackend = null;       // 'flv' | 'mse' | 'avplay'
+    var startToken = 0;             // bumps on every (re)start; stale async steps check it
+    var relaySessionId = null;
+    var relayPollTimer = null;
+    var mseFailedForRelay = false;  // MSE could not decode the relay stream: automatic mode uses AVPlay
     var reconnectTimer = null;
     var reconnectAttempt = 0;
     var overlayTimer = null;
     var lastMediaInfo = null;
+    var lastRelayStatus = null;
 
     // ------------------------------------------------------------------ settings
 
@@ -113,6 +151,20 @@
 
     // ------------------------------------------------------------------ form rendering
 
+    function visibleRows() {
+        return rows.filter(function (row) { return !row.classList.contains('hidden'); });
+    }
+
+    // Rows marked data-mode only apply to one connection mode.
+    function applyModeVisibility() {
+        rows.forEach(function (row) {
+            var mode = row.getAttribute('data-mode');
+            if (mode) {
+                row.classList.toggle('hidden', mode !== settings.mode);
+            }
+        });
+    }
+
     function renderRow(row) {
         var field = row.getAttribute('data-field');
         if (!field) {
@@ -122,20 +174,30 @@
         if (type === 'text') {
             row.querySelector('input').value = settings[field];
         } else {
-            row.querySelector('.value').textContent = String(settings[field]);
+            var value = String(settings[field]);
+            row.querySelector('.value').textContent = LABELS.hasOwnProperty(value) ? LABELS[value] : value;
         }
     }
 
     function renderForm() {
+        applyModeVisibility();
         rows.forEach(renderRow);
     }
 
-    function setFocus(index) {
-        focusIndex = Math.max(0, Math.min(rows.length - 1, index));
-        rows.forEach(function (row, i) {
-            row.classList.toggle('focused', i === focusIndex);
+    // target: a row element, or an index into the visible rows.
+    function setFocus(target) {
+        var list = visibleRows();
+        var index = typeof target === 'number' ? target : list.indexOf(target);
+        index = Math.max(0, Math.min(list.length - 1, index));
+        focusedRow = list[index];
+        rows.forEach(function (row) {
+            row.classList.toggle('focused', row === focusedRow);
         });
-        rows[focusIndex].scrollIntoView({ block: 'nearest' });
+        focusedRow.scrollIntoView({ block: 'nearest' });
+    }
+
+    function moveFocus(direction) {
+        setFocus(visibleRows().indexOf(focusedRow) + direction);
     }
 
     function cycleOption(row, direction) {
@@ -145,6 +207,9 @@
         index = (index + direction + options.length) % options.length;
         settings[field] = options[index];
         renderRow(row);
+        if (field === 'mode') {
+            applyModeVisibility();
+        }
         saveSettings();
     }
 
@@ -196,7 +261,11 @@
         if (!settings.host) {
             return 'Enter the camera IP address first.';
         }
-        if (settings.port && !/^\d+$/.test(settings.port)) {
+        if (settings.mode === 'rtsp') {
+            if (settings.rtspPort && !/^\d+$/.test(settings.rtspPort)) {
+                return 'RTSP port must be a number.';
+            }
+        } else if (settings.port && !/^\d+$/.test(settings.port)) {
             return 'Port must be a number.';
         }
         return null;
@@ -210,6 +279,8 @@
             return;
         }
         showSetupMessage('');
+        mseFailedForRelay = false;
+        reconnectAttempt = 0;
         showView('player');
         startPlayer();
     }
@@ -223,6 +294,7 @@
     }
 
     function exitApp() {
+        stopRelaySession();
         try {
             window.tizen.application.getCurrentApplication().exit();
         } catch (e) {
@@ -230,7 +302,7 @@
         }
     }
 
-    // ------------------------------------------------------------------ player
+    // ------------------------------------------------------------------ status overlay
 
     function setStatus(text, isError) {
         el.status.textContent = text;
@@ -276,29 +348,62 @@
         return parts.join('  ·  ');
     }
 
+    function bufferLag() {
+        if (!el.video.buffered.length) {
+            return '';
+        }
+        var lag = el.video.buffered.end(el.video.buffered.length - 1) - el.video.currentTime;
+        return '  ·  buffer ' + lag.toFixed(1) + 's';
+    }
+
+    // ------------------------------------------------------------------ codec support
+
+    // Can this TV's browser decode the codec through Media Source Extensions?
+    function mseCanPlay(codec) {
+        if (!window.MediaSource || !window.mpegts || !window.mpegts.isSupported()) {
+            return false;
+        }
+        var types = codec === 'H265'
+            ? ['video/mp4; codecs="hvc1.1.6.L153.B0"', 'video/mp4; codecs="hev1.1.6.L153.B0"']
+            : ['video/mp4; codecs="avc1.640028"'];
+        for (var i = 0; i < types.length; i++) {
+            try {
+                if (window.MediaSource.isTypeSupported(types[i])) {
+                    return true;
+                }
+            } catch (e) {
+                // Fall through: treat as unsupported.
+            }
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------------ mpegts.js (FLV and relay TS)
+
     function onMediaInfo(info) {
         lastMediaInfo = info;
-        if (/hevc|hvc1|hev1|h265/i.test(info.videoCodec || '')) {
-            setStatus('Stream is H.265. Select the Sub stream, or set the camera\'s main stream to H.264.', true);
+        if (activeBackend === 'flv' && /hevc|hvc1|hev1|h265/i.test(info.videoCodec || '') && !mseCanPlay('H265')) {
+            setStatus('This stream is H.265 and the TV\'s browser cannot decode it. Switch Connection to RTSP, choose the Sub stream, or set the camera\'s main stream to H.264.', true);
         }
     }
 
     function onStatistics(stats) {
+        if (activeBackend !== 'flv') {
+            return;   // relay modes render their stats from the relay's status
+        }
         var speed = stats.speed ? (stats.speed / 1024).toFixed(2) + ' MB/s' : '';
         var dropped = stats.droppedFrames ? '  ·  dropped ' + stats.droppedFrames : '';
-        var latency = '';
-        if (el.video.buffered.length) {
-            var lag = el.video.buffered.end(el.video.buffered.length - 1) - el.video.currentTime;
-            latency = '  ·  buffer ' + lag.toFixed(1) + 's';
-        }
         el.stats.textContent = describeMediaInfo(lastMediaInfo) +
-            (speed ? '\n' + speed : '') + dropped + latency +
+            (speed ? '\n' + speed : '') + dropped + bufferLag() +
             '\n' + maskPassword(buildStreamUrl(settings));
     }
 
     function explainError(type, detail, info) {
         var message = (info && info.msg) ? info.msg : '';
         if (type === 'NetworkError') {
+            if (activeBackend === 'mse') {
+                return 'The relay stream dropped.';
+            }
             if (/40[13]/.test(message) || (info && (info.code === 401 || info.code === 403))) {
                 return 'Login rejected. Check the username and password.';
             }
@@ -310,7 +415,9 @@
         }
         if (type === 'MediaError') {
             if (/codec|not supported|unsupported/i.test(message + ' ' + detail)) {
-                return 'The TV cannot decode this stream. Use the Sub stream or set the camera to H.264.';
+                return activeBackend === 'mse'
+                    ? 'The browser player cannot decode this stream. Set Player to TV player (AVPlay).'
+                    : 'The TV cannot decode this stream. Switch Connection to RTSP, use the Sub stream, or set the camera to H.264.';
             }
             return 'Playback error: ' + (detail || message);
         }
@@ -318,7 +425,453 @@
     }
 
     function onPlayerError(type, detail, info) {
+        if (activeBackend === 'mse' && type === 'MediaError' && settings.rtspPlayer === 'auto' && !mseFailedForRelay) {
+            switchToAvPlay();
+            return;
+        }
         scheduleReconnect(explainError(type, detail, info));
+    }
+
+    function startMsePlayer(url, type, hasAudio) {
+        if (!window.mpegts || !window.mpegts.isSupported()) {
+            setStatus('This TV does not support Media Source Extensions. ' +
+                (settings.mode === 'rtsp' ? 'Set Player to TV player (AVPlay).' : 'Switch Connection to RTSP and Player to TV player.'), true);
+            return;
+        }
+        player = window.mpegts.createPlayer({
+            type: type,
+            isLive: true,
+            url: url,
+            hasVideo: true,
+            hasAudio: hasAudio
+        }, MPEGTS_CONFIG);
+
+        player.attachMediaElement(el.video);
+        player.on(window.mpegts.Events.ERROR, onPlayerError);
+        player.on(window.mpegts.Events.MEDIA_INFO, onMediaInfo);
+        player.on(window.mpegts.Events.STATISTICS_INFO, onStatistics);
+        player.on(window.mpegts.Events.LOADING_COMPLETE, function () {
+            scheduleReconnect(activeBackend === 'mse' ? 'The relay closed the stream.' : 'The camera closed the stream.');
+        });
+
+        player.load();
+        var playPromise = player.play();
+        if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch(function (err) {
+                setStatus('Playback could not start: ' + (err && err.message ? err.message : err), true);
+            });
+        }
+    }
+
+    function startFlvPlayback() {
+        activeBackend = 'flv';
+        var url = buildStreamUrl(settings);
+        setStatus('Connecting to ' + settings.host + ' (channel ' + settings.channel + ', ' + settings.stream + ' stream)…');
+        el.stats.textContent = maskPassword(url);
+        startMsePlayer(url, 'flv', settings.audio === 'on');
+    }
+
+    function destroyMsePlayer() {
+        if (!player) {
+            return;
+        }
+        try {
+            player.pause();
+            player.unload();
+            player.detachMediaElement();
+            player.destroy();
+        } catch (e) {
+            // Ignore teardown errors; a fresh player is created on the next start.
+        }
+        player = null;
+    }
+
+    // ------------------------------------------------------------------ relay service (RTSP mode)
+
+    function relayRequest(method, path, body, cb) {
+        var xhr = new XMLHttpRequest();
+        xhr.open(method, RELAY_BASE + path, true);
+        xhr.timeout = 4000;
+        xhr.onreadystatechange = function () {
+            if (xhr.readyState !== 4) {
+                return;
+            }
+            if (xhr.status === 0) {
+                cb(new Error('relay unreachable'));
+                return;
+            }
+            var data = null;
+            try {
+                data = JSON.parse(xhr.responseText);
+            } catch (e) {
+                data = null;
+            }
+            cb(null, data || {}, xhr.status);
+        };
+        xhr.ontimeout = function () {
+            cb(new Error('relay timeout'));
+        };
+        if (body) {
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            xhr.send(JSON.stringify(body));
+        } else {
+            xhr.send();
+        }
+    }
+
+    function relayServiceId() {
+        try {
+            var info = window.tizen.application.getCurrentApplication().appInfo;
+            return (info.packageId || info.id.split('.')[0]) + '.relay';
+        } catch (e) {
+            return null;   // desktop browser: run `node service/relay.js` by hand
+        }
+    }
+
+    function launchRelayService(cb) {
+        var id = relayServiceId();
+        if (!id) {
+            cb(null);
+            return;
+        }
+        try {
+            window.tizen.application.launch(id, function () { cb(null); }, function (e) { cb(e); });
+        } catch (e) {
+            cb(e);
+        }
+    }
+
+    // Make sure the relay answers; launch it if it is not running yet.
+    function ensureRelay(cb) {
+        relayRequest('GET', '/ping', null, function (err, data) {
+            if (!err && data.ok) {
+                cb(null);
+                return;
+            }
+            launchRelayService(function (launchErr) {
+                var tries = 0;
+                (function poll() {
+                    relayRequest('GET', '/ping', null, function (err2, data2) {
+                        if (!err2 && data2.ok) {
+                            cb(null);
+                            return;
+                        }
+                        if (++tries >= RELAY_LAUNCH_TRIES) {
+                            var name = launchErr ? String(launchErr.name || launchErr.message || '') : '';
+                            if (/NotFound/i.test(name)) {
+                                cb(new Error('RTSP mode needs the full package (ReolinkViewer.wgt, 2018 and newer TVs). This installation has no relay service.'));
+                            } else {
+                                cb(new Error('The relay service did not start' + (name ? ' (' + name + ')' : '') + '.'));
+                            }
+                            return;
+                        }
+                        setTimeout(poll, 300);
+                    });
+                }());
+            });
+        });
+    }
+
+    function stopRelaySession() {
+        clearInterval(relayPollTimer);
+        if (relaySessionId) {
+            relaySessionId = null;
+            relayRequest('POST', '/stop', {}, function () {});
+        }
+    }
+
+    function explainRelayError(st) {
+        var code = st.errorCode;
+        if (code === 'auth') {
+            return 'Login rejected by the camera. Check the username and password.';
+        }
+        if (code === 'unreachable') {
+            return 'Cannot reach ' + settings.host + ':' + (settings.rtspPort || '554') +
+                ' over RTSP. Check the IP, and that RTSP is enabled on the camera (Network → Advanced → Port Settings).';
+        }
+        if (code === 'notfound') {
+            return 'No stream at the known RTSP paths. Check the channel number, or fill in the RTSP path.';
+        }
+        if (code === 'busy') {
+            return 'The camera refused: too many viewers. Close the Reolink app elsewhere and try again.';
+        }
+        return st.error || 'Relay error.';
+    }
+
+    function startRelayPlayback(token) {
+        activeBackend = null;
+        lastRelayStatus = null;
+        setStatus('Starting the RTSP relay…');
+        el.stats.textContent = '';
+        ensureRelay(function (err) {
+            if (token !== startToken) {
+                return;
+            }
+            if (err) {
+                scheduleReconnect(err.message);
+                return;
+            }
+            relayRequest('POST', '/start', {
+                host: settings.host,
+                port: parseInt(settings.rtspPort, 10) || 554,
+                user: settings.user,
+                pass: settings.password,
+                channel: settings.channel,
+                stream: settings.stream,
+                path: settings.rtspPath,
+                audio: settings.audio === 'on'
+            }, function (err2, data) {
+                if (token !== startToken) {
+                    return;
+                }
+                if (err2 || !data.ok) {
+                    scheduleReconnect('The relay could not start: ' + (err2 ? err2.message : data.error));
+                    return;
+                }
+                relaySessionId = data.id;
+                setStatus('Connecting to ' + settings.host + ' over RTSP…');
+                el.stats.textContent = data.url || '';
+                waitForRelay(token, Date.now());
+            });
+        });
+    }
+
+    // Poll until the relay has video (first keyframe), then pick a player.
+    function waitForRelay(token, since) {
+        relayRequest('GET', '/status', null, function (err, st) {
+            if (token !== startToken) {
+                return;
+            }
+            if (err) {
+                scheduleReconnect('Lost contact with the relay.');
+                return;
+            }
+            if (st.state === 'error') {
+                scheduleReconnect(explainRelayError(st));
+                return;
+            }
+            if (st.state === 'playing') {
+                chooseRelayPlayer(token, st);
+                return;
+            }
+            if (Date.now() - since > RELAY_START_TIMEOUT_MS) {
+                scheduleReconnect('The relay got no video from the camera.' + (st.note ? ' ' + st.note + '.' : ''));
+                return;
+            }
+            if (st.state === 'waiting') {
+                setStatus('Connected. Waiting for the first keyframe…');
+            }
+            setTimeout(function () { waitForRelay(token, since); }, 500);
+        });
+    }
+
+    function chooseRelayPlayer(token, st) {
+        var codec = st.video ? st.video.codec : '';
+        var choice = settings.rtspPlayer;
+        if (choice === 'auto') {
+            choice = (!mseFailedForRelay && mseCanPlay(codec)) ? 'mse' : 'avplay';
+        }
+        lastRelayStatus = st;
+        if (choice === 'mse') {
+            activeBackend = 'mse';
+            setStatus('Opening the browser player (' + (codec === 'H265' ? 'H.265' : 'H.264') + ')…');
+            startMsePlayer(RELAY_BASE + '/live.ts?t=' + Date.now(), 'mpegts', !!st.audio);
+            startRelayPolling(token);
+        } else {
+            activeBackend = 'avplay';
+            waitForSegments(token, Date.now());
+        }
+    }
+
+    // MSE gave up on the relay stream mid-way: keep the relay session, hand the
+    // stream to AVPlay instead.
+    function switchToAvPlay() {
+        mseFailedForRelay = true;
+        startToken += 1;
+        var token = startToken;
+        clearInterval(relayPollTimer);
+        destroyMsePlayer();
+        setStatus('The browser player cannot decode this stream. Switching to the TV player…');
+        activeBackend = 'avplay';
+        waitForSegments(token, Date.now());
+    }
+
+    function waitForSegments(token, since) {
+        relayRequest('GET', '/status', null, function (err, st) {
+            if (token !== startToken) {
+                return;
+            }
+            if (err) {
+                scheduleReconnect('Lost contact with the relay.');
+                return;
+            }
+            if (st.state === 'error') {
+                scheduleReconnect(explainRelayError(st));
+                return;
+            }
+            if (st.segments >= HLS_MIN_SEGMENTS) {
+                startAvPlayer(token, RELAY_BASE + '/live.m3u8');
+                return;
+            }
+            setStatus('Buffering for the TV player (' + st.segments + '/' + HLS_MIN_SEGMENTS + ')…');
+            if (Date.now() - since > 30000) {
+                scheduleReconnect('The relay did not produce enough video for the TV player.');
+                return;
+            }
+            setTimeout(function () { waitForSegments(token, since); }, 500);
+        });
+    }
+
+    // ------------------------------------------------------------------ AVPlay (HLS from the relay)
+
+    function startAvPlayer(token, url) {
+        var av = window.webapis && window.webapis.avplay;
+        if (!av) {
+            scheduleReconnect('AVPlay is not available on this TV. Set Player to Browser (MSE).');
+            return;
+        }
+        try {
+            av.open(url);
+            av.setDisplayRect(0, 0, window.innerWidth || 1920, window.innerHeight || 1080);
+            try {
+                av.setDisplayMethod('PLAYER_DISPLAY_MODE_LETTER_BOX');
+            } catch (e) {
+                // Older firmware: default display method is fine.
+            }
+            av.setListener({
+                onbufferingstart: function () { setStatus('Buffering…'); },
+                onbufferingprogress: function () {},
+                onbufferingcomplete: function () { reconnectAttempt = 0; setStatus('Live'); },
+                oncurrentplaytime: function () {},
+                onstreamcompleted: function () { scheduleReconnect('The stream ended.'); },
+                onevent: function () {},
+                onerror: function (e) { scheduleReconnect('TV player error: ' + e); },
+                ondrmevent: function () {},
+                onsubtitlechange: function () {}
+            });
+            avplayActive = true;
+            avplayPaused = false;
+            document.body.classList.add('avplay');
+            el.video.classList.add('hidden');
+            el.avObject.classList.remove('hidden');
+            setStatus('Opening the TV player…');
+            av.prepareAsync(function () {
+                if (token !== startToken) {
+                    return;
+                }
+                try {
+                    av.play();
+                } catch (e) {
+                    scheduleReconnect('TV player could not start: ' + (e.message || e));
+                    return;
+                }
+                reconnectAttempt = 0;
+                setStatus('Live');
+            }, function (e) {
+                if (token !== startToken) {
+                    return;
+                }
+                scheduleReconnect('TV player could not open the stream: ' + (e && e.message ? e.message : e));
+            });
+            startRelayPolling(token);
+        } catch (e) {
+            scheduleReconnect('TV player error: ' + (e.message || e));
+        }
+    }
+
+    function stopAvPlayer() {
+        if (avplayActive) {
+            try { window.webapis.avplay.stop(); } catch (e) { /* already stopped */ }
+            try { window.webapis.avplay.close(); } catch (e2) { /* already closed */ }
+        }
+        avplayActive = false;
+        avplayPaused = false;
+        document.body.classList.remove('avplay');
+        el.video.classList.remove('hidden');
+        el.avObject.classList.add('hidden');
+    }
+
+    // ------------------------------------------------------------------ relay status polling
+
+    function startRelayPolling(token) {
+        clearInterval(relayPollTimer);
+        relayPollTimer = setInterval(function () {
+            if (token !== startToken) {
+                clearInterval(relayPollTimer);
+                return;
+            }
+            relayRequest('GET', '/status', null, function (err, st) {
+                if (token !== startToken) {
+                    return;
+                }
+                if (err) {
+                    scheduleReconnect('Lost contact with the relay.');
+                    return;
+                }
+                if (st.state === 'error') {
+                    scheduleReconnect(explainRelayError(st));
+                    return;
+                }
+                if (st.state === 'stopped' || st.state === 'idle' || (relaySessionId && st.id !== relaySessionId)) {
+                    scheduleReconnect('The relay stopped the stream.');
+                    return;
+                }
+                lastRelayStatus = st;
+                renderRelayStats(st);
+            });
+        }, RELAY_POLL_MS);
+    }
+
+    function renderRelayStats(st) {
+        var parts = [];
+        if (st.video) {
+            parts.push(st.video.codec === 'H265' ? 'H.265' : 'H.264');
+        }
+        if (activeBackend === 'mse' && lastMediaInfo && lastMediaInfo.width) {
+            parts.push(lastMediaInfo.width + 'x' + lastMediaInfo.height);
+        }
+        if (st.fps) {
+            parts.push(st.fps + ' fps');
+        }
+        if (st.audio) {
+            parts.push('AAC');
+        } else if (st.note) {
+            parts.push(st.note);
+        }
+        parts.push(activeBackend === 'avplay' ? 'TV player (HLS)' : 'browser player (MSE)');
+        var line2 = st.kbps ? (st.kbps / 1000).toFixed(1) + ' Mbit/s' : '';
+        if (st.rtpLost) {
+            line2 += '  ·  RTP loss ' + st.rtpLost;
+        }
+        if (activeBackend === 'mse') {
+            line2 += bufferLag();
+        }
+        el.stats.textContent = parts.join('  ·  ') + (line2 ? '\n' + line2 : '') + '\n' + (st.url || '');
+    }
+
+    // ------------------------------------------------------------------ player lifecycle
+
+    function startPlayer() {
+        clearTimeout(reconnectTimer);
+        startToken += 1;
+        clearInterval(relayPollTimer);
+        destroyMsePlayer();
+        stopAvPlayer();
+        lastMediaInfo = null;
+        if (settings.mode === 'rtsp') {
+            startRelayPlayback(startToken);
+        } else {
+            startFlvPlayback();
+        }
+    }
+
+    // Stop everything, including the relay session so the camera's viewer slot is freed.
+    function destroyPlayer() {
+        startToken += 1;
+        destroyMsePlayer();
+        stopAvPlayer();
+        stopRelaySession();
+        activeBackend = null;
     }
 
     function scheduleReconnect(reason) {
@@ -336,65 +889,12 @@
         }, delay);
     }
 
-    function startPlayer() {
-        clearTimeout(reconnectTimer);
-        destroyPlayer();
-
-        if (!window.mpegts || !window.mpegts.isSupported()) {
-            setStatus('This TV does not support Media Source Extensions for live H.264 FLV. Playback is not possible on this model.', true);
-            return;
-        }
-
-        var url = buildStreamUrl(settings);
-        setStatus('Connecting to ' + settings.host + ' (channel ' + settings.channel + ', ' + settings.stream + ' stream)…');
-        el.stats.textContent = maskPassword(url);
-
-        player = window.mpegts.createPlayer({
-            type: 'flv',
-            isLive: true,
-            url: url,
-            hasVideo: true,
-            hasAudio: settings.audio === 'on'
-        }, MPEGTS_CONFIG);
-
-        player.attachMediaElement(el.video);
-        player.on(window.mpegts.Events.ERROR, onPlayerError);
-        player.on(window.mpegts.Events.MEDIA_INFO, onMediaInfo);
-        player.on(window.mpegts.Events.STATISTICS_INFO, onStatistics);
-        player.on(window.mpegts.Events.LOADING_COMPLETE, function () {
-            scheduleReconnect('The camera closed the stream.');
-        });
-
-        player.load();
-        var playPromise = player.play();
-        if (playPromise && typeof playPromise.catch === 'function') {
-            playPromise.catch(function (err) {
-                setStatus('Playback could not start: ' + (err && err.message ? err.message : err), true);
-            });
-        }
-    }
-
-    function destroyPlayer() {
-        if (!player) {
-            return;
-        }
-        try {
-            player.pause();
-            player.unload();
-            player.detachMediaElement();
-            player.destroy();
-        } catch (e) {
-            // Ignore teardown errors; a fresh player is created on the next start.
-        }
-        player = null;
-    }
-
     function stopAndReturnToSetup() {
         clearTimeout(reconnectTimer);
         reconnectAttempt = 0;
         destroyPlayer();
         showView('setup');
-        setFocus(focusIndex);
+        setFocus(focusedRow);
     }
 
     function changeChannel(direction) {
@@ -405,6 +905,17 @@
     }
 
     function togglePlayPause() {
+        if (activeBackend === 'avplay') {
+            if (avplayPaused) {
+                reconnectAttempt = 0;
+                startPlayer();
+            } else {
+                try { window.webapis.avplay.pause(); } catch (e) { /* ignore */ }
+                avplayPaused = true;
+                setStatus('Paused');
+            }
+            return;
+        }
         if (!player) {
             return;
         }
@@ -425,10 +936,19 @@
         setStatus('Live');
     });
     el.video.addEventListener('waiting', function () {
-        setStatus('Buffering…');
+        if (activeBackend !== 'avplay') {
+            setStatus('Buffering…');
+        }
     });
     el.video.addEventListener('error', function () {
+        if (activeBackend === 'avplay') {
+            return;
+        }
         var err = el.video.error;
+        if (activeBackend === 'mse' && settings.rtspPlayer === 'auto' && !mseFailedForRelay && err && err.code === 3) {
+            switchToAvPlay();   // MEDIA_ERR_DECODE
+            return;
+        }
         scheduleReconnect('Video element error' + (err ? ' (code ' + err.code + ')' : '') + '.');
     });
 
@@ -448,22 +968,21 @@
             return;
         }
 
-        var row = rows[focusIndex];
         switch (event.keyCode) {
             case KEY.UP:
-                setFocus(focusIndex - 1);
+                moveFocus(-1);
                 break;
             case KEY.DOWN:
-                setFocus(focusIndex + 1);
+                moveFocus(1);
                 break;
             case KEY.LEFT:
-                adjustRow(row, -1);
+                adjustRow(focusedRow, -1);
                 break;
             case KEY.RIGHT:
-                adjustRow(row, 1);
+                adjustRow(focusedRow, 1);
                 break;
             case KEY.ENTER:
-                activateRow(row);
+                activateRow(focusedRow);
                 break;
             case KEY.RETURN:
             case KEY.EXIT:
@@ -517,14 +1036,12 @@
     });
 
     // Mouse / pointer support (Tizen pointer remote, or a desktop browser during development).
-    rows.forEach(function (row, index) {
+    rows.forEach(function (row) {
         row.addEventListener('click', function (event) {
-            if (event.target.tagName === 'INPUT') {
-                setFocus(index);
-                return;
+            setFocus(row);
+            if (event.target.tagName !== 'INPUT') {
+                activateRow(row);
             }
-            setFocus(index);
-            activateRow(row);
         });
     });
     Array.prototype.slice.call(el.form.querySelectorAll('input')).forEach(function (input) {
@@ -532,6 +1049,7 @@
             commitInput(input);
         });
     });
+    el.overlay.addEventListener('click', toggleOverlay);
     el.video.addEventListener('click', toggleOverlay);
 
     function registerTvKeys() {
@@ -545,7 +1063,8 @@
         }
     }
 
-    // Free the decoder when the app goes to the background; reconnect when it comes back.
+    // Free the decoder (and the camera's viewer slot) when the app goes to the
+    // background; reconnect when it comes back.
     document.addEventListener('visibilitychange', function () {
         if (currentView !== 'player') {
             return;
@@ -563,7 +1082,7 @@
 
     registerTvKeys();
     renderForm();
-    setFocus(settings.host ? rows.length - 1 : 0);
+    setFocus(settings.host ? visibleRows().length - 1 : 0);
 
     if (settings.autoconnect === 'on' && !validateSettings()) {
         showView('player');

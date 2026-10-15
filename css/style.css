@@ -31,8 +31,8 @@ html, body {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
-    padding: 14px 28px;
-    margin-bottom: 8px;
+    padding: 12px 28px;
+    margin-bottom: 6px;
     border: 3px solid transparent;
     border-radius: 12px;
     background: #161b22;
@@ -90,6 +90,15 @@ footer {
 
 /* ---------- Player ---------- */
 #view-player { background: #000; }
+/* AVPlay paints on a hardware plane behind the page: everything above it must
+ * be transparent while it is in use, or the video is hidden behind the page. */
+body.avplay, body.avplay #view-player { background: transparent; }
+#av-player {
+    position: absolute;
+    top: 0; left: 0;
+    width: 1920px;
+    height: 1080px;
+}
 #video {
     position: absolute;
     top: 0; right: 0; bottom: 0; left: 0;
@@ -110,3 +119,4 @@ footer {
 .status { font-size: 32px; margin-bottom: 8px; }
 .status.error { color: #f85149; }
 .stats { color: #8b949e; font-size: 22px; margin-bottom: 8px; white-space: pre; }
+.status .detail { display: block; color: #c9d1d9; font-size: 24px; margin-top: 6px; }
