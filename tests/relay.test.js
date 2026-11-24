@@ -426,6 +426,62 @@ test('relay: RTSP in, TS and HLS out', async () => {
     }
 });
 
+test('relay: slots carry several cameras at once', async () => {
+    const camA = await fakeCamera({ user: 'admin', pass: 'hunter2' });
+    const camB = await fakeCamera({ user: 'admin', pass: 'hunter2' });
+    const relayServer = http.createServer(relay.handle);
+    await new Promise((resolve) => relayServer.listen(0, '127.0.0.1', resolve));
+    const base = 'http://127.0.0.1:' + relayServer.address().port;
+    const start = (cam, slot) => post(base, '/start', { host: '127.0.0.1', port: cam.port, user: 'admin', pass: 'hunter2', channel: 0, stream: 'sub', audio: false, slot });
+    const waitFor = async (slot, wanted) => {
+        let status;
+        for (let i = 0; i < 100; i++) {
+            status = JSON.parse((await get(base, '/status?slot=' + slot)).body);
+            if (status.state === wanted || status.state === 'error') break;
+            await sleep(50);
+        }
+        assert.strictEqual(status.state, wanted, JSON.stringify(status));
+        return status;
+    };
+    try {
+        assert.strictEqual((await start(camA, 'tile0')).status, 200);
+        assert.strictEqual((await start(camB, 'tile1')).status, 200);
+        const a = await waitFor('tile0', 'playing');
+        const b = await waitFor('tile1', 'playing');
+        assert.notStrictEqual(a.id, b.id);
+        assert.strictEqual(a.slot, 'tile0');
+        assert.strictEqual(b.audio, null, 'audio left out when not asked for');
+
+        for (const slot of ['tile0', 'tile1']) {
+            const live = await get(base, '/live.ts?slot=' + slot, { timeout: 1000, maxBytes: 20000 });
+            assert.strictEqual(live.status, 200);
+            assert.strictEqual(tsPackets(live.body)[0].pid, 0, slot + ' starts with a PAT');
+        }
+        assert.strictEqual((await get(base, '/live.ts')).status, 409, 'nothing in the default slot');
+
+        const stopped = await post(base, '/stop', { slot: 'tile0' });
+        assert.strictEqual(stopped.json.ok, true);
+        await waitFor('tile0', 'stopped');
+        assert.strictEqual(JSON.parse((await get(base, '/status?slot=tile1')).body).state, 'playing', 'the other slot keeps running');
+
+        assert.strictEqual((await start(camA, 'no/such slot')).status, 400);
+        assert.strictEqual((await get(base, '/status?slot=__proto__')).status, 200);
+        assert.strictEqual((await get(base, '/status?slot=a.b')).status, 400);
+
+        for (const slot of ['s1', 's2', 's3', 's4']) assert.strictEqual((await start(camA, slot)).status, 200);
+        assert.strictEqual((await start(camA, 's5')).status, 409, 'sixth concurrent stream is refused');
+        assert.strictEqual((await start(camA, 's4')).status, 200, 'restarting a running slot is not');
+
+        await post(base, '/stop', { all: true });
+        await waitFor('tile1', 'stopped');
+        assert.strictEqual(JSON.parse((await get(base, '/ping')).body).running, false);
+    } finally {
+        relay.stopAllSessions();
+        relayServer.close();
+        for (const cam of [camA, camB]) cam.server.close();
+    }
+});
+
 test('relay: wrong password is reported as an auth error', async () => {
     const cam = await fakeCamera({ user: 'admin', pass: 'right' });
     try {

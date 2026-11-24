@@ -21,14 +21,17 @@
  *
  * Control:
  *   GET  /ping           { ok, version, running }
- *   POST /start          { host, port, user, pass, channel, stream, path, audio }
- *   POST /stop
+ *   POST /start          { host, port, user, pass, channel, stream, path, audio, slot }
+ *   POST /stop           { slot } for one stream, { all: true } for every stream
  *   GET  /status         what the relay is doing, codecs, bitrate, errors
  *   GET  /log            the last few hundred log lines
  *
- * One camera at a time. Starting a new session stops the previous one. A
- * session with nobody reading its output is closed after a minute, because
- * Reolink counts the relay as a viewer and viewer slots are scarce.
+ * One camera per slot. The slot is a short name chosen by the caller ("main"
+ * when left out); the media and status URLs take it as ?slot=<name>. The
+ * full-screen player uses "main", every tile of the camera grid its own slot.
+ * Starting a session in a slot stops the previous one in that slot. A session
+ * with nobody reading its output is closed after a minute, because Reolink
+ * counts the relay as a viewer and viewer slots are scarce.
  *
  * Self-contained on purpose: no npm dependencies, pure ES5, and only the
  * parts of Buffer the TV's old Node build is known to have (see the shims).
@@ -39,7 +42,7 @@ var net    = require('net');
 var crypto = require('crypto');
 var urlMod = require('url');
 
-var VERSION = '1.1.0';
+var VERSION = '1.2.0';
 var PORT        = 8129;
 var LISTEN_HOST = '127.0.0.1';
 
@@ -953,10 +956,15 @@ var MAX_SEGMENTS = 8;
 var MAX_RING_BYTES = 24 * 1024 * 1024;
 var IDLE_STOP_MS = 60000;
 
-var session = null;
+var DEFAULT_SLOT = 'main';
+var MAX_LIVE_SESSIONS = 5;            // the full-screen player plus four grid tiles
+
+var sessions = Object.create(null);    // slot name -> Session
+var sessionCounter = 0;
 
 function Session(params) {
-    this.id = Date.now().toString(36);
+    this.id = Date.now().toString(36) + '-' + (++sessionCounter);
+    this.slot = params.slot || DEFAULT_SLOT;
     this.params = params;
     this.state = 'connecting';
     this.error = null;
@@ -1004,22 +1012,33 @@ function Session(params) {
 
 Session.prototype.failed = function (code, message) {
     if (this.state === 'stopped' || this.state === 'error') return;
-    log('SESSION_ERROR', { code: code, message: message });
+    log('SESSION_ERROR', { slot: this.slot, code: code, message: message });
     this.state = 'error';
     this.errorCode = code;
     this.error = message;
     this.rtsp.close();
     clearInterval(this.timer);
     this.endClients();
+    this.releaseBuffers();
 };
 
 Session.prototype.stop = function () {
     if (this.state === 'stopped') return;
-    log('SESSION_STOP', { id: this.id, frames: this.frames, bytes: this.bytes });
+    log('SESSION_STOP', { id: this.id, slot: this.slot, frames: this.frames, bytes: this.bytes });
     this.state = 'stopped';
     this.rtsp.close();
     clearInterval(this.timer);
     this.endClients();
+    this.releaseBuffers();
+};
+
+/* A finished session stays in its slot to report its state; with several
+ * slots its video must not stay in memory with it. */
+Session.prototype.releaseBuffers = function () {
+    this.segments = [];
+    this.current = null;
+    this.lastKeyChunk = null;
+    this.ringBytes = 0;
 };
 
 Session.prototype.endClients = function () {
@@ -1185,7 +1204,7 @@ Session.prototype.tick = function () {
     if (this.videoDepacketizer) this.rtpLost = this.videoDepacketizer.lost;
     if (this.clients.length) this.lastMediaActivity = now;
     if (now - this.lastMediaActivity > IDLE_STOP_MS) {
-        log('SESSION_IDLE_STOP');
+        log('SESSION_IDLE_STOP', { slot: this.slot });
         this.stop();
         return;
     }
@@ -1198,6 +1217,7 @@ Session.prototype.status = function () {
     return {
         ok: true,
         id: this.id,
+        slot: this.slot,
         state: this.state,
         error: this.error,
         errorCode: this.errorCode,
@@ -1249,9 +1269,10 @@ Session.prototype.playlist = function () {
     for (var i = 0; i < segs.length; i++) target = Math.max(target, Math.ceil(segs[i].duration));
     var lines = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:' + target,
                  '#EXT-X-MEDIA-SEQUENCE:' + (segs.length ? segs[0].seq : 1)];
+    var query = this.slot === DEFAULT_SLOT ? '' : '?slot=' + this.slot;
     for (var j = 0; j < segs.length; j++) {
         lines.push('#EXTINF:' + segs[j].duration.toFixed(3) + ',');
-        lines.push('seg/' + segs[j].seq + '.ts');
+        lines.push('seg/' + segs[j].seq + '.ts' + query);
     }
     return lines.join('\n') + '\n';
 };
@@ -1306,9 +1327,35 @@ function readJsonBody(req, cb) {
     });
 }
 
+/* A slot name from a request, or null when it is not a usable one. */
+function slotName(value) {
+    if (value === undefined || value === null || value === '') return DEFAULT_SLOT;
+    var name = String(value);
+    return /^[A-Za-z0-9_-]{1,16}$/.test(name) ? name : null;
+}
+
+function isLive(s) {
+    return !!s && (s.state === 'connecting' || s.state === 'waiting' || s.state === 'playing');
+}
+
+function liveSessionCount(exceptSlot) {
+    var n = 0;
+    for (var slot in sessions) {
+        if (slot !== exceptSlot && isLive(sessions[slot])) n++;
+    }
+    return n;
+}
+
+function stopAllSessions() {
+    for (var slot in sessions) sessions[slot].stop();
+}
+
 function startSession(params) {
-    if (session) session.stop();
+    var slot = slotName(params.slot);
+    if (!slot) throw new Error('bad slot');
+    if (sessions[slot]) sessions[slot].stop();
     var p = {
+        slot: slot,
         host: String(params.host || '').trim(),
         port: parseInt(params.port, 10) || 554,
         user: String(params.user || ''),
@@ -1319,9 +1366,9 @@ function startSession(params) {
         audio: params.audio !== false && params.audio !== 'off'
     };
     p.paths = reolinkPaths(p);
-    log('SESSION_START', { host: p.host, port: p.port, user: p.user, paths: p.paths, audio: p.audio });
-    session = new Session(p);
-    return session;
+    log('SESSION_START', { slot: slot, host: p.host, port: p.port, user: p.user, paths: p.paths, audio: p.audio });
+    sessions[slot] = new Session(p);
+    return sessions[slot];
 }
 
 function handle(req, res) {
@@ -1330,25 +1377,41 @@ function handle(req, res) {
     if (req.method === 'OPTIONS') { cors(res, 204, 'text/plain'); return res.end(); }
 
     if (path === '/ping') {
-        return sendJson(res, 200, { ok: true, version: VERSION, running: !!(session && (session.state === 'playing' || session.state === 'connecting' || session.state === 'waiting')) });
+        return sendJson(res, 200, { ok: true, version: VERSION, running: liveSessionCount(null) > 0 });
     }
     if (path === '/log') return sendJson(res, 200, { ok: true, logs: LOGS });
+    var slot = slotName(u.query.slot);
+    if (!slot) return sendJson(res, 400, { ok: false, error: 'bad slot' });
+    var session = sessions[slot] || null;
+
     if (path === '/status') {
-        if (!session) return sendJson(res, 200, { ok: true, state: 'idle' });
+        if (!session) return sendJson(res, 200, { ok: true, slot: slot, state: 'idle' });
         return sendJson(res, 200, session.status());
     }
     if (path === '/start' && req.method === 'POST') {
         return readJsonBody(req, function (err, body) {
             if (err) return sendJson(res, 400, { ok: false, error: err.message });
             if (!body.host) return sendJson(res, 400, { ok: false, error: 'host required' });
+            var target = slotName(body.slot);
+            if (!target) return sendJson(res, 400, { ok: false, error: 'bad slot' });
+            if (liveSessionCount(target) >= MAX_LIVE_SESSIONS) return sendJson(res, 409, { ok: false, error: 'too many streams' });
             var s;
             try { s = startSession(body); } catch (e) { log('START_THREW', e && e.stack); return sendJson(res, 500, { ok: false, error: 'service error: ' + (e && e.message) }); }
             sendJson(res, 200, { ok: true, id: s.id, url: s.rtsp.url() });
         });
     }
     if (path === '/stop' && req.method === 'POST') {
-        if (session) session.stop();
-        return sendJson(res, 200, { ok: true });
+        return readJsonBody(req, function (err, body) {
+            var request = err ? {} : body;
+            if (request.all) {
+                stopAllSessions();
+            } else {
+                var stopSlot = slotName(request.slot);
+                if (!stopSlot) return sendJson(res, 400, { ok: false, error: 'bad slot' });
+                if (sessions[stopSlot]) sessions[stopSlot].stop();
+            }
+            sendJson(res, 200, { ok: true });
+        });
     }
     if (path === '/live.ts') {
         if (!session || session.state === 'stopped' || session.state === 'error') return sendJson(res, 409, { ok: false, error: 'no stream' });
@@ -1406,6 +1469,7 @@ module.exports = {
     RtspClient: RtspClient,
     reolinkPaths: reolinkPaths,
     startSession: startSession,
-    currentSession: function () { return session; },
+    stopAllSessions: stopAllSessions,
+    currentSession: function (slot) { return sessions[slot || DEFAULT_SLOT] || null; },
     logs: LOGS
 };
