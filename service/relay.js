@@ -758,6 +758,9 @@ RtspClient.prototype.send = function (method, url, headers, cb) {
 
 /* Interleaved framing: '$' channel length(2) RTP|RTCP, mixed with text responses. */
 RtspClient.prototype.onData = function (chunk) {
+    // After close() the socket stays open for a moment to flush TEARDOWN. An
+    // answer that still arrives then (PLAY, say) must not restart anything.
+    if (this.closed) return;
     this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : chunk;
     while (this.buffer.length) {
         if (this.buffer[0] === 0x24) {                                   // '$'
@@ -939,6 +942,7 @@ RtspClient.prototype.play = function () {
 RtspClient.prototype.startKeepalive = function () {
     var self = this;
     clearInterval(this.keepaliveTimer);
+    if (this.closed) return;
     var every = Math.max(5, Math.min(30, Math.floor(this.timeoutSec / 2))) * 1000;
     this.keepaliveTimer = setInterval(function () {
         if (self.closed) return;
