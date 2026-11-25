@@ -3,7 +3,8 @@
 # Reolink Viewer
 
 Watch a Reolink camera on a Samsung TV. Type the camera's local IP address and
-login, press Start, and the live stream fills the screen. Nothing leaves your
+login, press Start, and the live stream fills the screen. Save up to four
+cameras and watch them side by side in a grid. Nothing leaves your
 network: there is no cloud account, no relay server, no app server. The TV talks
 straight to the camera.
 
@@ -44,6 +45,33 @@ Not keen on RTSP? The zero-effort alternative for an H.265 camera is to set
 its main stream to H.264 in the Reolink app (Camera → Display/Stream → Main
 Stream → Encoding) or to drop the resolution below 4K. On a TV the difference
 is rarely visible.
+
+## Several cameras at once
+
+The **Camera** field at the top of the setup screen is a number from 1 to 4.
+Each number is a camera of its own, with its own address, login and connection
+settings; for an NVR, enter the NVR's address under each number and give each
+one a different **Channel**. A new number starts with the login and connection
+settings of the camera before it, so usually only the IP address is left to
+type. Empty the IP address to remove a camera.
+
+Set **View** to **All cameras in a grid** and Start shows every camera that has
+an IP address: two side by side, three or four as a 2 x 2 mosaic. Move the
+highlight with the arrow keys and press **OK** to watch that camera full
+screen, with the stream and audio settings you gave it; **Back** returns to
+the grid.
+
+The tiles are deliberately light: always the **Sub** stream, no sound, played
+in the browser. Cameras in RTSP mode go through the relay, which now carries
+one stream per tile. Two limits to know about:
+
+- **How many tiles show a picture depends on the TV.** A TV has a fixed number
+  of video decoders, and some models can play only one or two streams at the
+  same time. A tile that gets no picture says so and keeps retrying; the other
+  tiles are not affected. This has not been tested on hardware yet, so reports
+  with your model are welcome.
+- **Every tile is a viewer** as far as the camera is concerned. If the camera
+  refuses the connection, close the Reolink app elsewhere.
 
 ## Will it work on my TV?
 
@@ -97,7 +125,7 @@ Setup screen:
 | Key | What it does |
 | --- | --- |
 | **▲ / ▼** | Move between fields |
-| **◀ / ▶** | Change a choice (connection, stream, channel, audio, player) |
+| **◀ / ▶** | Change a choice (camera number, connection, stream, channel, audio, player, view) |
 | **OK** | On a text field: open the on-screen keyboard. On a choice: next option. On Start: connect |
 | **Back** | Exit the app |
 
@@ -108,6 +136,14 @@ While watching:
 | **OK** | Show or hide the info overlay (codec, resolution, bandwidth, player, stream URL) |
 | **CH ▲ / ▼** (or ▲ / ▼) | Switch NVR channel |
 | **Play / Pause** | Pause; pressing again reconnects to the live edge |
+| **Back** or **Stop** | Back to the grid if you came from it, otherwise to the setup screen |
+
+In the grid:
+
+| Key | What it does |
+| --- | --- |
+| **▲ ▼ ◀ ▶** | Move the highlight between cameras |
+| **OK** | Watch the highlighted camera full screen |
 | **Back** or **Stop** | Back to the setup screen |
 
 Settings are remembered on the TV, including the password, so the next launch is
@@ -115,8 +151,9 @@ one press on Start. Turn on **Connect automatically on launch** to skip even
 that.
 
 If the stream drops, the app reconnects on its own with increasing delays. Press
-Back to stop it trying. Leaving the player screen, or sending the app to the
-background, closes the camera connection so your viewer slot is freed.
+Back to stop it trying. In the grid every tile reconnects by itself. Leaving
+the player or the grid, or sending the app to the background, closes the
+camera connections so your viewer slots are freed.
 
 ## Troubleshooting
 
@@ -131,6 +168,9 @@ background, closes the camera connection so your viewer slot is freed.
 | *RTSP mode needs the full package* | You installed `ReolinkViewer-legacy.wgt`, which has no relay. Install `ReolinkViewer.wgt` (2018+ TVs). |
 | *The relay service did not start* | The TV refused to launch the background service. Reinstall the package; if it persists, open an issue with your model. |
 | *The browser player cannot decode this stream* | Set **Player** to TV player (AVPlay). Automatic does this by itself after the first failure. |
+| *No picture. This TV may not be able to play this many streams at once* (grid) | The TV ran out of video decoders. Remove a camera from the grid, or watch that camera full screen with OK. |
+| *This stream is H.265, which this TV cannot show in the grid* | A custom **RTSP path** points at an H.265 stream and the TV's browser has no H.265 decoder. Leave RTSP path empty so the grid can use the H.264 Sub stream, or watch it full screen. |
+| *The grid needs at least two cameras* | Only one camera has an IP address. Choose **Camera** 2 and fill it in, or set **View** to One camera. |
 | *This TV does not support Media Source Extensions* | A very old or unusual firmware. In RTSP mode, set Player to TV player. |
 
 ## Build and install by hand
@@ -177,7 +217,8 @@ google-chrome --disable-web-security --user-data-dir=/tmp/chrome-dev index.html
 For RTSP mode on the desktop, run the relay by hand (`node service/relay.js`,
 it listens on 127.0.0.1:8129) and the app will find it. The relay's own API is
 documented at the top of `service/relay.js`; `GET /status` and `GET /log` are
-handy while debugging.
+handy while debugging. Grid tiles use the relay slots `tile0` to `tile3`
+(`GET /status?slot=tile0`); the full-screen player uses the default slot.
 
 The relay is written for the TV's old Node.js build: plain ES5, no npm
 packages, and only the parts of `Buffer` that are known to exist there.

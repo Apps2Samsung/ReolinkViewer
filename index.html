@@ -12,10 +12,15 @@
 <section id="view-setup" class="view">
     <header>
         <h1>Reolink Viewer</h1>
-        <p class="hint">Enter the camera's local IP and login, then choose Start. Use the remote's arrow keys to move, OK to edit.</p>
+        <p class="hint">Enter the camera's local IP and login, then choose Start. Use the remote's arrow keys to move, OK to edit. Add more cameras with the Camera number.</p>
     </header>
 
     <div id="form" class="form">
+        <div class="row focusable" data-field="camera" data-scope="app" data-type="stepper" data-min="1" data-max="4">
+            <label>Camera</label>
+            <div class="value" id="f-camera"></div>
+            <div class="row-hint">Up to 4 cameras or NVR channels. Pick a number, then fill in its address and login below. Empty the IP address to remove a camera.</div>
+        </div>
         <div class="row focusable" data-field="host" data-type="text">
             <label>Camera / NVR IP address</label>
             <input id="f-host" type="text" placeholder="192.168.1.50" autocomplete="off" spellcheck="false">
@@ -70,7 +75,12 @@
             <div class="value" id="f-rtspPlayer"></div>
             <div class="row-hint">Automatic uses the browser player (lowest delay) and switches to the TV player when the browser cannot decode the stream. The TV player runs a few seconds behind live.</div>
         </div>
-        <div class="row focusable" data-field="autoconnect" data-type="toggle" data-options="off,on">
+        <div class="row focusable" data-field="view" data-scope="app" data-type="toggle" data-options="single,grid">
+            <label>View</label>
+            <div class="value" id="f-view"></div>
+            <div class="row-hint">One camera shows the camera chosen at the top, full screen. The grid shows every camera that has an IP address at once, on the light Sub stream and without sound; OK on a camera opens it full screen.</div>
+        </div>
+        <div class="row focusable" data-field="autoconnect" data-scope="app" data-type="toggle" data-options="off,on">
             <label>Connect automatically on launch</label>
             <div class="value" id="f-autoconnect"></div>
         </div>
@@ -94,6 +104,14 @@
         <div id="status" class="status">Connecting…</div>
         <div id="stats" class="stats"></div>
         <div class="keys">OK info &nbsp; CH ▲▼ channel &nbsp; RETURN back</div>
+    </div>
+</section>
+
+<!-- ============ Camera grid ============ -->
+<section id="view-grid" class="view hidden">
+    <div id="grid" class="grid"></div>
+    <div id="grid-hint" class="overlay">
+        <div class="keys">▲▼◀▶ choose camera &nbsp; OK full screen &nbsp; RETURN back</div>
     </div>
 </section>
 

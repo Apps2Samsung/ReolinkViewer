@@ -12,6 +12,11 @@
  *    when the browser cannot decode H.265, by Samsung's AVPlay from a live
  *    HLS playlist. Needs Tizen 4.0 (2018 models) for the service.
  *
+ * Up to four cameras (or NVR channels) can be saved. One plays full screen as
+ * described above; the grid shows all of them at once as small muted players
+ * on the Sub stream, each with its own mpegts.js player and, in RTSP mode,
+ * its own slot in the relay.
+ *
  * Everything stays on the local network; the only thing the app talks to is
  * the camera / NVR the user typed in, and the relay on the TV itself.
  */
@@ -29,7 +34,10 @@
         CH_UP: 427, CH_DOWN: 428
     };
 
-    var DEFAULTS = {
+    var MAX_CAMERAS = 4;
+
+    // Per camera.
+    var CAMERA_DEFAULTS = {
         host: '',
         port: '80',
         scheme: 'http',
@@ -41,7 +49,13 @@
         mode: 'flv',            // 'flv' | 'rtsp'
         rtspPort: '554',
         rtspPath: '',           // '' = Reolink's standard paths
-        rtspPlayer: 'auto',     // 'auto' | 'mse' | 'avplay'
+        rtspPlayer: 'auto'      // 'auto' | 'mse' | 'avplay'
+    };
+
+    // For the app as a whole (form rows marked data-scope="app").
+    var APP_DEFAULTS = {
+        camera: 1,              // 1-based: the camera the form edits and the player shows
+        view: 'single',         // 'single' | 'grid'
         autoconnect: 'off'
     };
 
@@ -51,7 +65,9 @@
         rtsp: 'RTSP via relay (H.264 / H.265)',
         auto: 'Automatic',
         mse: 'Browser (MSE)',
-        avplay: 'TV player (AVPlay)'
+        avplay: 'TV player (AVPlay)',
+        single: 'One camera',
+        grid: 'All cameras in a grid'
     };
 
     var MPEGTS_CONFIG = {
@@ -79,11 +95,19 @@
     var RELAY_POLL_MS = 1000;
     var HLS_MIN_SEGMENTS = 3;             // AVPlay wants a few segments before it starts
 
-    var settings = loadSettings();
+    var GRID_COLUMNS = 2;
+    var GRID_STREAM = 'sub';              // tiles are small: the light H.264 stream is enough
+    var GRID_STALL_MS = 20000;            // a tile must show a picture in this time
+
+    var store = loadStore();
+    var settings = store.cameras[store.camera - 1];   // the selected camera
 
     var el = {
         setup: document.getElementById('view-setup'),
         player: document.getElementById('view-player'),
+        gridView: document.getElementById('view-grid'),
+        grid: document.getElementById('grid'),
+        gridHint: document.getElementById('grid-hint'),
         form: document.getElementById('form'),
         setupMessage: document.getElementById('setup-message'),
         video: document.getElementById('video'),
@@ -94,8 +118,10 @@
     };
 
     var rows = Array.prototype.slice.call(el.form.querySelectorAll('.focusable'));
+    var hostRow = el.form.querySelector('[data-field="host"]');
+    var cameraRow = el.form.querySelector('[data-field="camera"]');
     var focusedRow = null;
-    var currentView = 'setup';
+    var currentView = 'setup';      // 'setup' | 'player' | 'grid'
 
     var player = null;              // mpegts.js player (FLV or relay TS)
     var avplayActive = false;       // AVPlay has a stream open
@@ -111,28 +137,90 @@
     var lastMediaInfo = null;
     var lastRelayStatus = null;
 
+    var relayUsed = false;          // the relay answered at least once: tell it to stop on exit
+    var relayWaiters = null;        // callbacks waiting for one shared ensureRelay() round
+    var tiles = [];                 // the grid's Tile objects
+    var gridFocus = 0;              // index into tiles
+    var gridHintTimer = null;
+    var returnToGrid = false;       // the full-screen player was opened from the grid
+
     // ------------------------------------------------------------------ settings
 
-    function loadSettings() {
-        var saved = {};
-        try {
-            saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '{}');
-        } catch (e) {
-            saved = {};
-        }
+    function withDefaults(saved, defaults) {
         var merged = {};
-        Object.keys(DEFAULTS).forEach(function (key) {
-            merged[key] = saved.hasOwnProperty(key) ? saved[key] : DEFAULTS[key];
+        Object.keys(defaults).forEach(function (key) {
+            merged[key] = saved && saved.hasOwnProperty(key) ? saved[key] : defaults[key];
         });
         return merged;
     }
 
+    function loadStore() {
+        var saved = {};
+        try {
+            saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '{}') || {};
+        } catch (e) {
+            saved = {};
+        }
+        // Before the grid there was one camera, saved as a flat object: it becomes camera 1.
+        var savedCameras = Array.isArray(saved.cameras) ? saved.cameras : [saved];
+        var loaded = withDefaults(saved, APP_DEFAULTS);
+        loaded.cameras = [];
+        for (var i = 0; i < MAX_CAMERAS; i++) {
+            loaded.cameras.push(withDefaults(savedCameras[i], CAMERA_DEFAULTS));
+        }
+        loaded.camera = Math.max(1, Math.min(MAX_CAMERAS, parseInt(loaded.camera, 10) || 1));
+        return loaded;
+    }
+
     function saveSettings() {
         try {
-            window.localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+            window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
         } catch (e) {
             // Storage unavailable: the app still works for this session.
         }
+    }
+
+    // Indexes of the cameras that have an address: the ones the grid shows.
+    function configuredCameras() {
+        var list = [];
+        store.cameras.forEach(function (camera, index) {
+            if (camera.host) {
+                list.push(index);
+            }
+        });
+        return list;
+    }
+
+    // Make camera `number` (1-based) the one the form edits and the player shows.
+    function selectCamera(number) {
+        store.camera = number;
+        settings = store.cameras[number - 1];
+        if (!settings.host) {
+            // An unused camera starts as a copy of a neighbour, minus the address:
+            // login and connection settings are usually the same on every camera.
+            var used = configuredCameras();
+            if (used.length) {
+                var source = store.cameras[used[0]];
+                used.forEach(function (index) {
+                    if (index < number - 1) {
+                        source = store.cameras[index];
+                    }
+                });
+                Object.keys(CAMERA_DEFAULTS).forEach(function (key) {
+                    if (key !== 'host') {
+                        settings[key] = source[key];
+                    }
+                });
+            }
+        }
+        saveSettings();
+        renderForm();
+    }
+
+    function cameraName(index) {
+        var camera = store.cameras[index];
+        return 'Camera ' + (index + 1) + '  ·  ' + camera.host +
+            (parseInt(camera.channel, 10) > 0 ? '  ·  channel ' + camera.channel : '');
     }
 
     function buildStreamUrl(opts) {
@@ -165,6 +253,11 @@
         });
     }
 
+    // The object a row's field lives in: the app-wide settings or the selected camera.
+    function fieldOwner(row) {
+        return row.getAttribute('data-scope') === 'app' ? store : settings;
+    }
+
     function renderRow(row) {
         var field = row.getAttribute('data-field');
         if (!field) {
@@ -173,8 +266,10 @@
         var type = row.getAttribute('data-type');
         if (type === 'text') {
             row.querySelector('input').value = settings[field];
+        } else if (field === 'camera') {
+            row.querySelector('.value').textContent = store.camera + '  ·  ' + (settings.host || 'not set up');
         } else {
-            var value = String(settings[field]);
+            var value = String(fieldOwner(row)[field]);
             row.querySelector('.value').textContent = LABELS.hasOwnProperty(value) ? LABELS[value] : value;
         }
     }
@@ -203,9 +298,10 @@
     function cycleOption(row, direction) {
         var field = row.getAttribute('data-field');
         var options = row.getAttribute('data-options').split(',');
-        var index = options.indexOf(String(settings[field]));
+        var owner = fieldOwner(row);
+        var index = options.indexOf(String(owner[field]));
         index = (index + direction + options.length) % options.length;
-        settings[field] = options[index];
+        owner[field] = options[index];
         renderRow(row);
         if (field === 'mode') {
             applyModeVisibility();
@@ -217,8 +313,13 @@
         var field = row.getAttribute('data-field');
         var min = parseInt(row.getAttribute('data-min'), 10);
         var max = parseInt(row.getAttribute('data-max'), 10);
-        var value = parseInt(settings[field], 10) + direction;
-        settings[field] = Math.max(min, Math.min(max, value));
+        var owner = fieldOwner(row);
+        var value = Math.max(min, Math.min(max, parseInt(owner[field], 10) + direction));
+        if (field === 'camera') {
+            selectCamera(value);
+            return;
+        }
+        owner[field] = value;
         renderRow(row);
         saveSettings();
     }
@@ -251,34 +352,75 @@
         var field = input.parentNode.getAttribute('data-field');
         settings[field] = input.value.trim();
         saveSettings();
+        if (field === 'host') {
+            renderRow(cameraRow);
+        }
     }
 
     function showSetupMessage(text) {
         el.setupMessage.textContent = text || '';
     }
 
-    function validateSettings() {
-        if (!settings.host) {
+    function validateCamera(camera) {
+        if (!camera.host) {
             return 'Enter the camera IP address first.';
         }
-        if (settings.mode === 'rtsp') {
-            if (settings.rtspPort && !/^\d+$/.test(settings.rtspPort)) {
+        if (camera.mode === 'rtsp') {
+            if (camera.rtspPort && !/^\d+$/.test(camera.rtspPort)) {
                 return 'RTSP port must be a number.';
             }
-        } else if (settings.port && !/^\d+$/.test(settings.port)) {
+        } else if (camera.port && !/^\d+$/.test(camera.port)) {
             return 'Port must be a number.';
         }
         return null;
     }
 
+    // What stops Start from working, as { message, row }, or null when it can go ahead.
+    function startProblem() {
+        if (store.view !== 'grid') {
+            var message = validateCamera(settings);
+            return message ? { message: message, row: hostRow } : null;
+        }
+        var used = configuredCameras();
+        if (used.length < 2) {
+            return {
+                message: 'The grid needs at least two cameras. Choose another Camera number and enter its IP address, or set View to One camera.',
+                row: cameraRow
+            };
+        }
+        for (var i = 0; i < used.length; i++) {
+            var problem = validateCamera(store.cameras[used[i]]);
+            if (problem) {
+                return { message: 'Camera ' + (used[i] + 1) + ': ' + problem, row: cameraRow };
+            }
+        }
+        return null;
+    }
+
+    function start() {
+        showSetupMessage('');
+        if (store.view === 'grid') {
+            gridFocus = Math.max(0, configuredCameras().indexOf(store.camera - 1));
+            showView('grid');
+            startGrid();
+        } else {
+            returnToGrid = false;
+            openPlayer();
+        }
+    }
+
     function startFromForm() {
-        var problem = validateSettings();
+        var problem = startProblem();
         if (problem) {
-            showSetupMessage(problem);
-            setFocus(0);
+            showSetupMessage(problem.message);
+            setFocus(problem.row);
             return;
         }
-        showSetupMessage('');
+        start();
+    }
+
+    // Show the selected camera full screen.
+    function openPlayer() {
         mseFailedForRelay = false;
         reconnectAttempt = 0;
         showView('player');
@@ -291,10 +433,14 @@
         currentView = name;
         el.setup.classList.toggle('hidden', name !== 'setup');
         el.player.classList.toggle('hidden', name !== 'player');
+        el.gridView.classList.toggle('hidden', name !== 'grid');
     }
 
     function exitApp() {
-        stopRelaySession();
+        relaySessionId = null;
+        if (relayUsed) {
+            relayRequest('POST', '/stop', { all: true }, function () {});
+        }
         try {
             window.tizen.application.getCurrentApplication().exit();
         } catch (e) {
@@ -545,6 +691,7 @@
     function ensureRelay(cb) {
         relayRequest('GET', '/ping', null, function (err, data) {
             if (!err && data.ok) {
+                relayUsed = true;
                 cb(null);
                 return;
             }
@@ -553,6 +700,7 @@
                 (function poll() {
                     relayRequest('GET', '/ping', null, function (err2, data2) {
                         if (!err2 && data2.ok) {
+                            relayUsed = true;
                             cb(null);
                             return;
                         }
@@ -572,6 +720,21 @@
         });
     }
 
+    // The same, for several callers at once (the grid's tiles): one round of
+    // pinging and launching serves them all.
+    function ensureRelayShared(cb) {
+        if (relayWaiters) {
+            relayWaiters.push(cb);
+            return;
+        }
+        relayWaiters = [cb];
+        ensureRelay(function (err) {
+            var waiting = relayWaiters;
+            relayWaiters = null;
+            waiting.forEach(function (waiter) { waiter(err); });
+        });
+    }
+
     function stopRelaySession() {
         clearInterval(relayPollTimer);
         if (relaySessionId) {
@@ -580,13 +743,13 @@
         }
     }
 
-    function explainRelayError(st) {
+    function explainRelayError(st, camera) {
         var code = st.errorCode;
         if (code === 'auth') {
             return 'Login rejected by the camera. Check the username and password.';
         }
         if (code === 'unreachable') {
-            return 'Cannot reach ' + settings.host + ':' + (settings.rtspPort || '554') +
+            return 'Cannot reach ' + camera.host + ':' + (camera.rtspPort || '554') +
                 ' over RTSP. Check the IP, and that RTSP is enabled on the camera (Network → Advanced → Port Settings).';
         }
         if (code === 'notfound') {
@@ -647,7 +810,7 @@
                 return;
             }
             if (st.state === 'error') {
-                scheduleReconnect(explainRelayError(st));
+                scheduleReconnect(explainRelayError(st, settings));
                 return;
             }
             if (st.state === 'playing') {
@@ -706,7 +869,7 @@
                 return;
             }
             if (st.state === 'error') {
-                scheduleReconnect(explainRelayError(st));
+                scheduleReconnect(explainRelayError(st, settings));
                 return;
             }
             if (st.segments >= HLS_MIN_SEGMENTS) {
@@ -809,7 +972,7 @@
                     return;
                 }
                 if (st.state === 'error') {
-                    scheduleReconnect(explainRelayError(st));
+                    scheduleReconnect(explainRelayError(st, settings));
                     return;
                 }
                 if (st.state === 'stopped' || st.state === 'idle' || (relaySessionId && st.id !== relaySessionId)) {
@@ -889,12 +1052,19 @@
         }, delay);
     }
 
-    function stopAndReturnToSetup() {
+    // Leave the full-screen player: back to the grid it was opened from, or to setup.
+    function closePlayer() {
         clearTimeout(reconnectTimer);
         reconnectAttempt = 0;
         destroyPlayer();
-        showView('setup');
-        setFocus(focusedRow);
+        if (returnToGrid) {
+            returnToGrid = false;
+            showView('grid');
+            startGrid();
+        } else {
+            showView('setup');
+            setFocus(focusedRow);
+        }
     }
 
     function changeChannel(direction) {
@@ -927,6 +1097,289 @@
             player.pause();
             setStatus('Paused');
         }
+    }
+
+    // ------------------------------------------------------------------ camera grid
+
+    // One camera in the grid: a muted player on the Sub stream. Tiles always use
+    // mpegts.js; AVPlay has a single hardware plane, so it cannot draw several.
+    function Tile(cameraIndex, slot) {
+        var self = this;
+        this.cameraIndex = cameraIndex;
+        this.camera = store.cameras[cameraIndex];
+        this.slot = slot;               // this tile's session in the relay (RTSP mode)
+        this.token = 0;                 // bumps on every (re)start; stale async steps check it
+        this.player = null;
+        this.relayStarted = false;
+        this.attempt = 0;
+        this.retryTimer = null;
+        this.stallTimer = null;
+
+        this.root = document.createElement('div');
+        this.root.className = 'tile';
+        this.video = document.createElement('video');
+        this.video.muted = true;
+        this.video.setAttribute('playsinline', '');
+        this.note = document.createElement('div');
+        this.note.className = 'tile-note';
+        var label = document.createElement('div');
+        label.className = 'tile-label';
+        label.textContent = cameraName(cameraIndex);
+        var frame = document.createElement('div');
+        frame.className = 'tile-frame';
+        [this.video, this.note, label, frame].forEach(function (child) {
+            self.root.appendChild(child);
+        });
+
+        this.video.addEventListener('playing', function () {
+            self.attempt = 0;
+            clearTimeout(self.stallTimer);
+            self.setNote('');
+        });
+        this.video.addEventListener('error', function () {
+            if (self.player) {
+                self.fail('The TV cannot decode this stream.');
+            }
+        });
+    }
+
+    Tile.prototype.setNote = function (text, isError) {
+        this.note.textContent = text;
+        this.note.classList.toggle('error', !!isError);
+    };
+
+    Tile.prototype.start = function () {
+        this.closePlayer();
+        var token = this.token;
+        this.setNote('Connecting…');
+        if (this.camera.mode === 'rtsp') {
+            this.startRelay(token);
+        } else {
+            var options = {};
+            Object.keys(this.camera).forEach(function (key) { options[key] = this.camera[key]; }, this);
+            options.stream = GRID_STREAM;
+            this.play(buildStreamUrl(options), 'flv');
+        }
+    };
+
+    Tile.prototype.startRelay = function (token) {
+        var self = this;
+        var camera = this.camera;
+        ensureRelayShared(function (err) {
+            if (token !== self.token) {
+                return;
+            }
+            if (err) {
+                self.fail(err.message);
+                return;
+            }
+            relayRequest('POST', '/start', {
+                slot: self.slot,
+                host: camera.host,
+                port: parseInt(camera.rtspPort, 10) || 554,
+                user: camera.user,
+                pass: camera.password,
+                channel: camera.channel,
+                stream: GRID_STREAM,
+                path: camera.rtspPath,
+                audio: false
+            }, function (err2, data) {
+                if (token !== self.token) {
+                    return;
+                }
+                if (err2 || !data.ok) {
+                    self.fail('The relay could not start: ' + (err2 ? err2.message : data.error));
+                    return;
+                }
+                self.relayStarted = true;
+                self.waitForRelay(token, Date.now());
+            });
+        });
+    };
+
+    // Poll until the relay has video (first keyframe), then play it.
+    Tile.prototype.waitForRelay = function (token, since) {
+        var self = this;
+        relayRequest('GET', '/status?slot=' + this.slot, null, function (err, st) {
+            if (token !== self.token) {
+                return;
+            }
+            if (err) {
+                self.fail('Lost contact with the relay.');
+                return;
+            }
+            if (st.state === 'error') {
+                self.fail(explainRelayError(st, self.camera));
+                return;
+            }
+            if (st.state === 'playing') {
+                var codec = st.video ? st.video.codec : '';
+                if (!mseCanPlay(codec)) {
+                    // Retrying will not help; free the camera's viewer slot.
+                    self.stop();
+                    self.setNote('This stream is ' + (codec === 'H265' ? 'H.265' : codec) +
+                        ', which this TV cannot show in the grid. Press OK to watch it full screen.', true);
+                    return;
+                }
+                self.play(RELAY_BASE + '/live.ts?slot=' + self.slot + '&t=' + Date.now(), 'mpegts');
+                return;
+            }
+            if (Date.now() - since > RELAY_START_TIMEOUT_MS) {
+                self.fail('The relay got no video from the camera.');
+                return;
+            }
+            setTimeout(function () { self.waitForRelay(token, since); }, 500);
+        });
+    };
+
+    Tile.prototype.play = function (url, type) {
+        var self = this;
+        if (!window.mpegts || !window.mpegts.isSupported()) {
+            this.setNote('This TV does not support Media Source Extensions, which the grid needs.', true);
+            return;
+        }
+        this.player = window.mpegts.createPlayer({
+            type: type,
+            isLive: true,
+            url: url,
+            hasVideo: true,
+            hasAudio: false
+        }, MPEGTS_CONFIG);
+        this.player.attachMediaElement(this.video);
+        this.player.on(window.mpegts.Events.ERROR, function (errorType, detail, info) {
+            self.fail(self.explainError(errorType, detail, info));
+        });
+        this.player.on(window.mpegts.Events.LOADING_COMPLETE, function () {
+            self.fail('The stream closed.');
+        });
+        this.player.load();
+        var playPromise = this.player.play();
+        if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch(function () {
+                // The stall timer reports a player that never starts.
+            });
+        }
+        this.stallTimer = setTimeout(function () {
+            self.fail('No picture. This TV may not be able to play this many streams at once.');
+        }, GRID_STALL_MS);
+    };
+
+    Tile.prototype.explainError = function (type, detail, info) {
+        if (type === 'NetworkError') {
+            if (this.camera.mode === 'rtsp') {
+                return 'The relay stream dropped.';
+            }
+            if (info && (info.code === 401 || info.code === 403)) {
+                return 'Login rejected.';
+            }
+            return 'Cannot reach ' + this.camera.host + '.';
+        }
+        if (type === 'MediaError') {
+            return 'The TV cannot decode this stream.';
+        }
+        return 'Error: ' + type + ' ' + (detail || '');
+    };
+
+    // Give up on this attempt and try again later, with increasing delays.
+    Tile.prototype.fail = function (reason) {
+        var self = this;
+        this.stop();
+        this.attempt += 1;
+        var delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * Math.pow(2, this.attempt - 1));
+        this.setNote(reason + '  Retrying in ' + Math.round(delay / 1000) + 's.', true);
+        this.retryTimer = setTimeout(function () { self.start(); }, delay);
+    };
+
+    Tile.prototype.closePlayer = function () {
+        this.token += 1;
+        clearTimeout(this.retryTimer);
+        clearTimeout(this.stallTimer);
+        if (!this.player) {
+            return;
+        }
+        try {
+            this.player.pause();
+            this.player.unload();
+            this.player.detachMediaElement();
+            this.player.destroy();
+        } catch (e) {
+            // Ignore teardown errors; a fresh player is created on the next start.
+        }
+        this.player = null;
+    };
+
+    // Stop everything, including the relay session so the camera's viewer slot is freed.
+    Tile.prototype.stop = function () {
+        this.closePlayer();
+        if (this.relayStarted) {
+            this.relayStarted = false;
+            relayRequest('POST', '/stop', { slot: this.slot }, function () {});
+        }
+    };
+
+    function stopGrid() {
+        tiles.forEach(function (tile) { tile.stop(); });
+    }
+
+    // Build a tile for every camera that has an address and connect them all.
+    function startGrid() {
+        stopGrid();
+        el.grid.innerHTML = '';
+        tiles = configuredCameras().map(function (cameraIndex, position) {
+            var tile = new Tile(cameraIndex, 'tile' + position);
+            tile.root.addEventListener('click', function () {
+                setGridFocus(position);
+                openFocusedTile();
+            });
+            el.grid.appendChild(tile.root);
+            return tile;
+        });
+        el.grid.className = 'grid ' + (tiles.length > GRID_COLUMNS ? 'grid-rows-2' : 'grid-rows-1');
+        setGridFocus(gridFocus);
+        showGridHint();
+        tiles.forEach(function (tile) { tile.start(); });
+    }
+
+    function setGridFocus(index) {
+        gridFocus = Math.max(0, Math.min(tiles.length - 1, index));
+        tiles.forEach(function (tile, position) {
+            tile.root.classList.toggle('focused', position === gridFocus);
+        });
+    }
+
+    function moveGridFocus(columns, rowsDown) {
+        var column = gridFocus % GRID_COLUMNS + columns;
+        var target = gridFocus + columns + rowsDown * GRID_COLUMNS;
+        if (column >= 0 && column < GRID_COLUMNS && target >= 0 && target < tiles.length) {
+            setGridFocus(target);
+        }
+    }
+
+    function showGridHint() {
+        el.gridHint.classList.remove('faded');
+        clearTimeout(gridHintTimer);
+        gridHintTimer = setTimeout(function () {
+            el.gridHint.classList.add('faded');
+        }, OVERLAY_HIDE_MS);
+    }
+
+    // Watch the highlighted camera full screen, with its own stream and audio
+    // settings. The tiles close first: the TV may have only one decoder to give.
+    function openFocusedTile() {
+        var tile = tiles[gridFocus];
+        if (!tile) {
+            return;
+        }
+        stopGrid();
+        returnToGrid = true;
+        selectCamera(tile.cameraIndex + 1);
+        openPlayer();
+    }
+
+    function closeGrid() {
+        stopGrid();
+        showView('setup');
+        setFocus(focusedRow);
     }
 
     // ------------------------------------------------------------------ video element events
@@ -997,7 +1450,7 @@
     function handlePlayerKey(event) {
         switch (event.keyCode) {
             case KEY.RETURN:
-                stopAndReturnToSetup();
+                closePlayer();
                 break;
             case KEY.EXIT:
                 exitApp();
@@ -1019,7 +1472,38 @@
                 togglePlayPause();
                 break;
             case KEY.STOP:
-                stopAndReturnToSetup();
+                closePlayer();
+                break;
+            default:
+                return;
+        }
+        event.preventDefault();
+    }
+
+    function handleGridKey(event) {
+        showGridHint();
+        switch (event.keyCode) {
+            case KEY.LEFT:
+                moveGridFocus(-1, 0);
+                break;
+            case KEY.RIGHT:
+                moveGridFocus(1, 0);
+                break;
+            case KEY.UP:
+                moveGridFocus(0, -1);
+                break;
+            case KEY.DOWN:
+                moveGridFocus(0, 1);
+                break;
+            case KEY.ENTER:
+                openFocusedTile();
+                break;
+            case KEY.RETURN:
+            case KEY.STOP:
+                closeGrid();
+                break;
+            case KEY.EXIT:
+                exitApp();
                 break;
             default:
                 return;
@@ -1030,6 +1514,8 @@
     document.addEventListener('keydown', function (event) {
         if (currentView === 'player') {
             handlePlayerKey(event);
+        } else if (currentView === 'grid') {
+            handleGridKey(event);
         } else {
             handleSetupKey(event);
         }
@@ -1066,6 +1552,14 @@
     // Free the decoder (and the camera's viewer slot) when the app goes to the
     // background; reconnect when it comes back.
     document.addEventListener('visibilitychange', function () {
+        if (currentView === 'grid') {
+            if (document.hidden) {
+                stopGrid();
+            } else {
+                startGrid();
+            }
+            return;
+        }
         if (currentView !== 'player') {
             return;
         }
@@ -1082,10 +1576,9 @@
 
     registerTvKeys();
     renderForm();
-    setFocus(settings.host ? visibleRows().length - 1 : 0);
+    setFocus(settings.host ? visibleRows().length - 1 : hostRow);
 
-    if (settings.autoconnect === 'on' && !validateSettings()) {
-        showView('player');
-        startPlayer();
+    if (store.autoconnect === 'on' && !startProblem()) {
+        start();
     }
 }());

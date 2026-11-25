@@ -108,6 +108,52 @@ body.avplay, body.avplay #view-player { background: transparent; }
     background: #000;
 }
 
+/* ---------- Camera grid ---------- */
+#view-grid { background: #000; }
+/* Two columns of 16:9 tiles: one row for two cameras, two rows for three or four. */
+.tile {
+    position: absolute;
+    left: 0;
+    width: 50%;
+    height: 50%;
+    background: #0d1117;
+}
+.tile:nth-child(even) { left: 50%; }
+.grid-rows-1 .tile { top: 25%; }
+.grid-rows-2 .tile { top: 0; }
+.grid-rows-2 .tile:nth-child(n+3) { top: 50%; }
+.tile video {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: #000;
+}
+.tile-note {
+    position: absolute;
+    left: 60px; right: 60px; top: 40%;
+    text-align: center;
+    color: #c9d1d9;
+    font-size: 24px;
+    text-shadow: 0 0 6px #000;
+}
+.tile-note.error { color: #f85149; }
+.tile-label {
+    position: absolute;
+    left: 16px; top: 16px;
+    padding: 4px 14px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.6);
+    font-size: 22px;
+}
+.tile-frame {
+    position: absolute;
+    top: 0; right: 0; bottom: 0; left: 0;
+    border: 2px solid #000;
+}
+.tile.focused .tile-frame { border: 5px solid #58a6ff; }
+
 .overlay {
     position: absolute;
     left: 0; right: 0; bottom: 0;
